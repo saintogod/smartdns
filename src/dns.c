@@ -2014,6 +2014,144 @@ int dns_encode(unsigned char *data, int size, struct dns_packet *packet)
 	return context.ptr - context.data;
 }
 
+static int _dns_update_an(struct dns_context *context, dns_rr_type type, struct dns_update_param *param)
+{
+	int ret;
+	int qtype = 0;
+	int qclass = 0;
+	int ttl;
+	int rr_len = 0;
+	char domain[DNS_MAX_CNAME_LEN];
+	unsigned char *start;
+
+	/* decode rr head */
+	ret = _dns_decode_rr_head(context, domain, DNS_MAX_CNAME_LEN, &qtype, &qclass, &ttl, &rr_len);
+	if (ret < 0) {
+		tlog(TLOG_DEBUG, "decode head failed.");
+		return -1;
+	}
+
+	start = context->ptr;
+	switch (qtype) {
+	case DNS_T_OPT:
+		break;
+	default: {
+		unsigned char *ttl_ptr = start - sizeof(int) - sizeof(short);
+		_dns_write_int(&ttl_ptr, param->ip_ttl);
+	} break;
+	}
+	context->ptr += rr_len;
+	if (context->ptr - start != rr_len) {
+		tlog(TLOG_ERROR, "length mitchmatch , %s, %ld:%d", domain, (long)(context->ptr - start), rr_len);
+		return -1;
+	}
+
+	return 0;
+}
+
+
+static int _dns_update_body(struct dns_context *context, struct dns_update_param *param)
+{
+	struct dns_packet *packet = context->packet;
+	struct dns_head *head = &packet->head;
+	int i = 0;
+	int ret = 0;
+	int count = 0;
+
+	count = head->qdcount;
+	head->qdcount = 0;
+	for (i = 0; i < count; i++) {
+		char domain[DNS_MAX_CNAME_LEN];
+		int qtype;
+		int qclass;
+		int len;
+		len = _dns_decode_qr_head(context, domain, DNS_MAX_CNAME_LEN, &qtype, &qclass);
+		if (len < 0) {
+			tlog(TLOG_DEBUG, "update qd failed.");
+			return -1;
+		}
+	}
+
+	count = head->ancount;
+	head->ancount = 0;
+	for (i = 0; i < count; i++) {
+		ret = _dns_update_an(context, DNS_RRS_AN, param);
+		if (ret < 0) {
+			tlog(TLOG_DEBUG, "update an failed.");
+			return -1;
+		}
+	}
+
+	count = head->nscount;
+	head->nscount = 0;
+	for (i = 0; i < count; i++) {
+		ret = _dns_update_an(context, DNS_RRS_NS, param);
+		if (ret < 0) {
+			tlog(TLOG_DEBUG, "update ns failed.");
+			return -1;
+		}
+	}
+
+	count = head->nrcount;
+	head->nrcount = 0;
+	for (i = 0; i < count; i++) {
+		ret = _dns_update_an(context, DNS_RRS_NR, param);
+		if (ret < 0) {
+			tlog(TLOG_DEBUG, "update nr failed.");
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
+int _dns_update_id(unsigned char *data, int size, struct dns_update_param *param) {
+
+	unsigned char *ptr = data;
+	_dns_write_short(&ptr, param->id);
+	return 0;
+}
+
+int dns_packet_update(unsigned char *data, int size, struct dns_update_param *param)
+{
+	struct dns_packet packet;
+	int maxsize = sizeof(packet);
+	struct dns_head *head = &packet.head;
+	struct dns_context context;
+	int ret = 0;
+
+	memset(&context, 0, sizeof(context));
+	memset(&packet, 0, sizeof(packet));
+
+	context.data = data;
+	context.packet = &packet;
+	context.ptr = data;
+	context.maxsize = size;
+
+	ret = dns_packet_init(&packet, maxsize, head);
+	if (ret != 0) {
+		return -1;
+	}
+
+	ret = _dns_decode_head(&context);
+	if (ret < 0) {
+		return -1;
+	}
+
+	ret = _dns_update_id(data, size, param);
+	if (ret < 0) {
+		return -1;
+	}
+
+	ret = _dns_update_body(&context, param);
+	if (ret < 0) {
+		tlog(TLOG_DEBUG, "decode body failed.\n");
+		return -1;
+	}	
+
+	return 0;
+}
+
 #if 0
 static void dns_debug(void)
 {

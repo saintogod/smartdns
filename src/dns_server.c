@@ -121,6 +121,12 @@ struct dns_server {
 	struct list_head request_list;
 };
 
+struct dns_response_packet {
+	atomic_t refcnt;
+	unsigned char inpacket[DNS_IN_PACKSIZE];
+	uint32_t inpacket_len;	
+};
+
 /* ip address lists of domain */
 struct dns_ip_address {
 	struct hlist_node node;
@@ -132,6 +138,8 @@ struct dns_ip_address {
 		unsigned char ipv6_addr[DNS_RR_AAAA_LEN];
 		unsigned char addr[0];
 	};
+
+	struct dns_response_packet *resp_packet;
 };
 
 struct dns_request {
@@ -139,6 +147,8 @@ struct dns_request {
 
 	struct dns_server_conn_head *conn;
 	uint32_t server_flags;
+
+	enum response_mode resp_mode;
 
 	/* dns request list */
 	struct list_head list;
@@ -205,9 +215,49 @@ struct dns_request {
 	struct dns_domain_check_order *check_order_list;
 };
 
+struct dns_result_context {
+	struct dns_request *request;
+	uint32_t result_flag;
+	char *domain;
+	struct dns_packet *packet;
+	uint8_t *inpacket;
+	int inpacket_len;
+};
+
 static struct dns_server server;
 
 static tlog_log *dns_audit;
+
+void _dns_response_packet_get(struct dns_response_packet *resp_packet) {
+	atomic_inc(&resp_packet->refcnt);
+}
+
+void _dns_response_packet_release(struct dns_response_packet *resp_packet) {
+	int refcnt = atomic_dec_return(&resp_packet->refcnt);
+
+	if (refcnt) {
+		if (refcnt < 0) {
+			tlog(TLOG_ERROR, "BUG: packet refcnt is %d", refcnt);
+			abort();
+		}
+		return;
+	}
+
+	free(resp_packet);
+}
+
+struct dns_response_packet *_dns_response_packet_new(void) {
+	struct dns_response_packet *resp_packet = NULL;
+
+	resp_packet = malloc(sizeof(*resp_packet));
+	if (resp_packet == NULL) {
+		return NULL;
+	}
+
+	memset(resp_packet, 0, sizeof(*resp_packet));
+	atomic_set(&resp_packet->refcnt, 1);
+	return resp_packet;
+}
 
 static int _dns_server_prefetch_request(char *domain, dns_type_t qtype, uint32_t server_flags);
 
@@ -1134,6 +1184,7 @@ static struct dns_request *_dns_server_new_request(void)
 	atomic_set(&request->refcnt, 0);
 	atomic_set(&request->notified, 0);
 	atomic_set(&request->do_callback, 0);
+	request->resp_mode = dns_conf_response_mode;
 	request->ping_ttl_v4 = -1;
 	request->ping_ttl_v6 = -1;
 	request->prefetch = 0;
@@ -1310,6 +1361,7 @@ static int _dns_ip_address_check_add(struct dns_request *request, unsigned char 
 		tlog(TLOG_ERROR, "malloc failed");
 		return -1;
 	}
+	memset(addr_map, 0, sizeof(*addr_map));
 
 	addr_map->addr_type = addr_type;
 	addr_map->hitnum = 1;
@@ -1407,14 +1459,32 @@ static int _dns_server_is_adblock_ipv6(unsigned char addr[16])
 	return -1;
 }
 
-static int _dns_server_process_answer_A(struct dns_rrs *rrs, struct dns_request *request, char *domain,
-										unsigned int result_flag, int ping_timeout)
+static int _dns_server_ping_timeout(struct dns_request *request) 
+{
+	int ping_timeout = DNS_PING_TIMEOUT;
+	unsigned long now = get_tick_count();
+
+	ping_timeout = ping_timeout - (now - request->send_tick);
+	if (ping_timeout > DNS_PING_TIMEOUT) {
+		ping_timeout = DNS_PING_TIMEOUT;
+	} else if (ping_timeout < 10) {
+		ping_timeout = 10;
+	}
+
+	return ping_timeout;
+}
+
+static int _dns_server_process_answer_A(struct dns_rrs *rrs, struct dns_result_context *context)
 {
 	int ttl;
 	int ip_check_result = 0;
 	unsigned char addr[4];
 	char name[DNS_MAX_CNAME_LEN] = {0};
 	char ip[DNS_MAX_CNAME_LEN] = {0};
+
+	struct dns_request *request = context->request;
+	char *domain = context->domain;
+	int result_flag = context->result_flag;
 
 	if (request->qtype != DNS_T_A) {
 		/* ignore non-matched query type */
@@ -1474,6 +1544,7 @@ static int _dns_server_process_answer_A(struct dns_rrs *rrs, struct dns_request 
 	sprintf(ip, "%d.%d.%d.%d", addr[0], addr[1], addr[2], addr[3]);
 
 	/* start ping */
+	int ping_timeout = _dns_server_ping_timeout(request);
 	if (_dns_server_check_speed(request, ip, 0, ping_timeout) != 0) {
 		_dns_server_request_release(request);
 	}
@@ -1481,14 +1552,17 @@ static int _dns_server_process_answer_A(struct dns_rrs *rrs, struct dns_request 
 	return 0;
 }
 
-static int _dns_server_process_answer_AAAA(struct dns_rrs *rrs, struct dns_request *request, char *domain,
-										   unsigned int result_flag, int ping_timeout)
+static int _dns_server_process_answer_AAAA(struct dns_rrs *rrs, struct dns_result_context *context)
 {
 	unsigned char addr[16];
 	char name[DNS_MAX_CNAME_LEN] = {0};
 	char ip[DNS_MAX_CNAME_LEN] = {0};
 	int ttl;
 	int ip_check_result = 0;
+
+	struct dns_request *request = context->request;
+	char *domain = context->domain;
+	int result_flag = context->result_flag;
 
 	if (request->qtype != DNS_T_AAAA) {
 		/* ignore non-matched query type */
@@ -1548,6 +1622,7 @@ static int _dns_server_process_answer_AAAA(struct dns_rrs *rrs, struct dns_reque
 			addr[14], addr[15]);
 
 	/* start ping */
+	int ping_timeout = _dns_server_ping_timeout(request);
 	if (_dns_server_check_speed(request, ip, 0, ping_timeout) != 0) {
 		_dns_server_request_release(request);
 	}
@@ -1555,8 +1630,7 @@ static int _dns_server_process_answer_AAAA(struct dns_rrs *rrs, struct dns_reque
 	return 0;
 }
 
-static int _dns_server_process_answer(struct dns_request *request, char *domain, struct dns_packet *packet,
-									  unsigned int result_flag)
+static int _dns_server_process_answer(struct dns_result_context *context)
 {
 	int ttl;
 	char name[DNS_MAX_CNAME_LEN] = {0};
@@ -1564,9 +1638,11 @@ static int _dns_server_process_answer(struct dns_request *request, char *domain,
 	int i = 0;
 	int j = 0;
 	struct dns_rrs *rrs = NULL;
-	int ping_timeout = DNS_PING_TIMEOUT;
-	unsigned long now = get_tick_count();
 	int ret = 0;
+
+	struct dns_request *request = context->request;
+	struct dns_packet *packet = context->packet;
+	char *domain = context->domain;
 
 	if (packet->head.rcode != DNS_RC_NOERROR && packet->head.rcode != DNS_RC_NXDOMAIN) {
 		if (request->rcode == DNS_RC_SERVFAIL) {
@@ -1577,19 +1653,12 @@ static int _dns_server_process_answer(struct dns_request *request, char *domain,
 		return -1;
 	}
 
-	ping_timeout = ping_timeout - (now - request->send_tick);
-	if (ping_timeout > DNS_PING_TIMEOUT) {
-		ping_timeout = DNS_PING_TIMEOUT;
-	} else if (ping_timeout < 10) {
-		ping_timeout = 10;
-	}
-
 	for (j = 1; j < DNS_RRS_END; j++) {
 		rrs = dns_get_rrs_start(packet, j, &rr_count);
 		for (i = 0; i < rr_count && rrs; i++, rrs = dns_get_rrs_next(packet, rrs)) {
 			switch (rrs->type) {
 			case DNS_T_A: {
-				ret = _dns_server_process_answer_A(rrs, request, domain, result_flag, ping_timeout);
+				ret = _dns_server_process_answer_A(rrs, context);
 				if (ret == -1) {
 					break;
 				} else if (ret == -2) {
@@ -1598,7 +1667,88 @@ static int _dns_server_process_answer(struct dns_request *request, char *domain,
 				request->rcode = packet->head.rcode;
 			} break;
 			case DNS_T_AAAA: {
-				ret = _dns_server_process_answer_AAAA(rrs, request, domain, result_flag, ping_timeout);
+				ret = _dns_server_process_answer_AAAA(rrs, context);
+				if (ret == -1) {
+					break;
+				} else if (ret == -2) {
+					continue;
+				}
+				request->rcode = packet->head.rcode;
+			} break;
+			case DNS_T_NS: {
+				char cname[DNS_MAX_CNAME_LEN];
+				dns_get_CNAME(rrs, name, DNS_MAX_CNAME_LEN, &ttl, cname, DNS_MAX_CNAME_LEN);
+				tlog(TLOG_DEBUG, "NS: %s ttl:%d cname: %s\n", name, ttl, cname);
+			} break;
+			case DNS_T_CNAME: {
+				char cname[DNS_MAX_CNAME_LEN];
+				dns_get_CNAME(rrs, name, DNS_MAX_CNAME_LEN, &ttl, cname, DNS_MAX_CNAME_LEN);
+				tlog(TLOG_DEBUG, "name:%s ttl: %d cname: %s\n", name, ttl, cname);
+				safe_strncpy(request->cname, cname, DNS_MAX_CNAME_LEN);
+				request->ttl_cname = ttl;
+				request->has_cname = 1;
+			} break;
+			case DNS_T_SOA: {
+				request->has_soa = 1;
+				request->rcode = packet->head.rcode;
+				dns_get_SOA(rrs, name, 128, &ttl, &request->soa);
+				tlog(TLOG_DEBUG,
+					 "domain: %s, qtype: %d, SOA: mname: %s, rname: %s, serial: %d, refresh: %d, retry: %d, expire: "
+					 "%d, minimum: %d",
+					 domain, request->qtype, request->soa.mname, request->soa.rname, request->soa.serial,
+					 request->soa.refresh, request->soa.retry, request->soa.expire, request->soa.minimum);
+				if (atomic_inc_return(&request->soa_num) >= (dns_server_num() / 2)) {
+					_dns_server_request_complete(request);
+				}
+			} break;
+			default:
+				tlog(TLOG_DEBUG, "%s, qtype: %d", name, rrs->type);
+				break;
+			}
+		}
+	}
+
+	return 0;
+}
+
+static int _dns_server_reply_whole_response(struct dns_result_context *context)
+{
+	int ttl;
+	char name[DNS_MAX_CNAME_LEN] = {0};
+	int rr_count;
+	int i = 0;
+	int j = 0;
+	struct dns_rrs *rrs = NULL;
+	int ret = 0;
+
+	struct dns_request *request = context->request;
+	struct dns_packet *packet = context->packet;
+	char *domain = context->domain;
+
+	if (packet->head.rcode != DNS_RC_NOERROR && packet->head.rcode != DNS_RC_NXDOMAIN) {
+		if (request->rcode == DNS_RC_SERVFAIL) {
+			request->rcode = packet->head.rcode;
+		}
+
+		tlog(TLOG_DEBUG, "inquery failed, %s, rcode = %d, id = %d\n", domain, packet->head.rcode, packet->head.id);
+		return -1;
+	}
+
+	for (j = 1; j < DNS_RRS_END; j++) {
+		rrs = dns_get_rrs_start(packet, j, &rr_count);
+		for (i = 0; i < rr_count && rrs; i++, rrs = dns_get_rrs_next(packet, rrs)) {
+			switch (rrs->type) {
+			case DNS_T_A: {
+				ret = _dns_server_process_answer_A(rrs, context);
+				if (ret == -1) {
+					break;
+				} else if (ret == -2) {
+					continue;
+				}
+				request->rcode = packet->head.rcode;
+			} break;
+			case DNS_T_AAAA: {
+				ret = _dns_server_process_answer_AAAA(rrs, context);
 				if (ret == -1) {
 					break;
 				} else if (ret == -2) {
@@ -1656,8 +1806,7 @@ static int dns_server_update_reply_packet_id(struct dns_request *request, unsign
 	return 0;
 }
 
-static int _dns_server_passthrough_rule_check(struct dns_request *request, char *domain, struct dns_packet *packet,
-											  unsigned int result_flag)
+static int _dns_server_passthrough_rule_check(struct dns_result_context *context)
 {
 	int ttl;
 	char name[DNS_MAX_CNAME_LEN] = {0};
@@ -1667,6 +1816,12 @@ static int _dns_server_passthrough_rule_check(struct dns_request *request, char 
 	struct dns_rrs *rrs = NULL;
 	int ip_check_result = 0;
 	int is_result_strict = 0;
+
+	struct dns_request *request = context->request;
+	struct dns_packet *packet = context->packet;
+	char *domain = context->domain;
+	int result_flag = context->result_flag;
+
 
 	if (packet->head.rcode != DNS_RC_NOERROR && packet->head.rcode != DNS_RC_NXDOMAIN) {
 		if (request->rcode == DNS_RC_SERVFAIL) {
@@ -1923,10 +2078,13 @@ static int _dns_server_setup_ipset_packet(struct dns_request *request, struct dn
 	return 0;
 }
 
-static int _dns_server_reply_passthrouth(struct dns_request *request, struct dns_packet *packet,
-										 unsigned char *inpacket, int inpacket_len)
+static int _dns_server_reply_passthrouth(struct dns_result_context *context)
 {
 	int ret = 0;
+	struct dns_request *request = context->request;
+	struct dns_packet *packet = context->packet;
+	unsigned char *inpacket = context->inpacket;
+	int inpacket_len = context->inpacket_len;
 
 	if (atomic_inc_return(&request->notified) != 1) {
 		return 0;
@@ -1976,6 +2134,14 @@ static int dns_server_resolve_callback(char *domain, dns_result_type rtype, unsi
 	int ip_num = 0;
 	int request_wait = 0;
 	int ret = 0;
+	struct dns_result_context context;
+
+	context.request = request;
+	context.result_flag = result_flag;
+	context.domain = domain;
+	context.inpacket = inpacket;
+	context.inpacket_len = inpacket_len;
+	context.packet = packet;
 
 	if (request == NULL) {
 		return -1;
@@ -1983,14 +2149,30 @@ static int dns_server_resolve_callback(char *domain, dns_result_type rtype, unsi
 
 	if (rtype == DNS_QUERY_RESULT) {
 		if (request->passthrough) {
-			ret = _dns_server_passthrough_rule_check(request, domain, packet, result_flag);
+			ret = _dns_server_passthrough_rule_check(&context);
 			if (ret == 0) {
 				return 0;
 			}
 
-			return _dns_server_reply_passthrouth(request, packet, inpacket, inpacket_len);
+			return _dns_server_reply_passthrouth(&context);
 		}
-		_dns_server_process_answer(request, domain, packet, result_flag);
+
+		if (request->resp_mode == RESPONSE_MODE_FASTEST_IP) {
+			_dns_server_process_answer(&context);
+		} else if (request->resp_mode == RESPONSE_MODE_WHOLE_RESPONSE) {
+			struct dns_response_packet *resp_packet = _dns_response_packet_new();
+			if (resp_packet == NULL) {
+				tlog(TLOG_ERROR, "malloc memory for response packet failed.");
+				return -1;
+			}
+	
+			memcpy(resp_packet->inpacket, inpacket, inpacket_len);
+			resp_packet->inpacket_len = inpacket_len;
+
+			_dns_server_reply_whole_response(&context);
+			_dns_response_packet_release(resp_packet);
+		}
+
 		return 0;
 	} else if (rtype == DNS_QUERY_ERR) {
 		tlog(TLOG_ERROR, "request faield, %s", domain);

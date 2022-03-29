@@ -93,6 +93,8 @@ struct dns_conf_address_rule dns_conf_address_rule;
 int dns_conf_dualstack_ip_selection;
 int dns_conf_dualstack_ip_selection_threshold = 30;
 
+enum response_mode dns_conf_response_mode = RESPONSE_MODE_FASTEST_IP;
+
 /* TTL */
 int dns_conf_rr_ttl;
 int dns_conf_rr_ttl_min;
@@ -1173,6 +1175,31 @@ static int _config_iplist_rule(char *subnet, enum address_rule rule)
 	return 0;
 }
 
+static int _config_response_mode(void *data, int argc, char *argv[])
+{
+	const char *mode[] = {"fastest-ip", "whole-response"};
+	int i = 0;
+	const int mode_count = sizeof(mode) / sizeof(char *);
+
+	if (argc <= 1) {
+		return 0;
+	}
+
+	for (i = 0; i < mode_count; i++) {
+		if (strncmp(mode[i], argv[1], strnlen(mode[1], 32)) != 0) {
+			continue;
+		}
+
+		if (i >= RESPONSE_MODE_END) {
+			break;
+		}
+		
+		dns_conf_response_mode = (enum response_mode)i;
+	}
+	
+	return 0;
+}
+
 static int _config_qtype_soa(void *data, int argc, char *argv[])
 {
 	struct dns_qtype_soa_list *soa_list;
@@ -1486,6 +1513,7 @@ static struct config_item _config_item[] = {
 	CONF_INT("rr-ttl-min", &dns_conf_rr_ttl_min, 0, CONF_INT_MAX),
 	CONF_INT("rr-ttl-max", &dns_conf_rr_ttl_max, 0, CONF_INT_MAX),
 	CONF_YESNO("force-AAAA-SOA", &dns_conf_force_AAAA_SOA),
+	CONF_CUSTOM("response-mode", _config_response_mode, NULL),
 	CONF_CUSTOM("force-qtype-SOA", _config_qtype_soa, NULL),
 	CONF_CUSTOM("blacklist-ip", _config_blacklist_ip, NULL),
 	CONF_CUSTOM("whitelist-ip", _conf_whitelist_ip, NULL),

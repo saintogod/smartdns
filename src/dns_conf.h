@@ -213,6 +213,12 @@ struct dns_qtype_soa_table {
 };
 extern struct dns_qtype_soa_table dns_qtype_soa_table;
 
+enum response_mode {
+	RESPONSE_MODE_FASTEST_IP,
+	RESPONSE_MODE_WHOLE_RESPONSE,
+	RESPONSE_MODE_END,
+};
+
 extern struct dns_bind_ip dns_conf_bind_ip[DNS_MAX_BIND_IP];
 extern int dns_conf_bind_ip_num;
 
@@ -253,6 +259,8 @@ extern struct dns_conf_address_rule dns_conf_address_rule;
 
 extern int dns_conf_dualstack_ip_selection;
 extern int dns_conf_dualstack_ip_selection_threshold;
+
+extern enum response_mode dns_conf_response_mode;
 
 extern int dns_conf_rr_ttl;
 extern int dns_conf_rr_ttl_min;

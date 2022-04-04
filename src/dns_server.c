@@ -192,8 +192,6 @@ struct dns_request {
 	int ttl_v6;
 	unsigned char ipv6_addr[DNS_RR_AAAA_LEN];
 
-	struct dns_response_packet *resp_packet;
-
 	struct dns_soa soa;
 	int has_soa;
 
@@ -841,11 +839,109 @@ errout:
 	return -1;
 }
 
-static int _dns_server_request_complete_A(struct dns_request *request)
+
+struct dns_ip_address *_dns_ip_address_get(struct dns_request *request, unsigned char *addr, dns_type_t addr_type)
 {
+	uint32_t key = 0;
+	struct dns_ip_address *addr_map = NULL;
+	struct dns_ip_address *addr_tmp = NULL;
+	int addr_len = 0;
+
+	if (addr_type == DNS_T_A) {
+		addr_len = DNS_RR_A_LEN;
+	} else if (addr_type == DNS_T_AAAA) {
+		addr_len = DNS_RR_AAAA_LEN;
+	} else {
+		return NULL;
+	}
+
+	/* store the ip address and the number of hits */
+	key = jhash(addr, addr_len, 0);
+	pthread_mutex_lock(&request->ip_map_lock);
+	hash_for_each_possible(request->ip_map, addr_tmp, node, key)
+	{
+		if (addr_type == DNS_T_A) {
+			if (memcmp(addr_tmp->ipv4_addr, addr, addr_len) == 0) {
+				addr_map = addr_tmp;
+				break;
+			}
+		} else if (addr_type == DNS_T_AAAA) {
+			if (memcmp(addr_tmp->ipv6_addr, addr, addr_len) == 0) {
+				addr_map = addr_tmp;
+				break;
+			}
+		}
+	}
+	pthread_mutex_unlock(&request->ip_map_lock);
+
+	return addr_map;
+}
+
+static int _dns_ip_address_check_add(struct dns_request *request, unsigned char *addr, dns_type_t addr_type,
+									 struct dns_response_packet *resp_packet)
+{
+	uint32_t key = 0;
+	struct dns_ip_address *addr_map = NULL;
+	int addr_len = 0;
+
+	if (addr_type == DNS_T_A) {
+		addr_len = DNS_RR_A_LEN;
+	} else if (addr_type == DNS_T_AAAA) {
+		addr_len = DNS_RR_AAAA_LEN;
+	} else {
+		return -1;
+	}
+
+	/* store the ip address and the number of hits */
+	key = jhash(addr, addr_len, 0);
+	pthread_mutex_lock(&request->ip_map_lock);
+	hash_for_each_possible(request->ip_map, addr_map, node, key)
+	{
+		if (addr_type == DNS_T_A) {
+			if (memcmp(addr_map->ipv4_addr, addr, addr_len) == 0) {
+				addr_map->hitnum++;
+				addr_map->recv_tick = get_tick_count();
+				pthread_mutex_unlock(&request->ip_map_lock);
+				return -1;
+			}
+		} else if (addr_type == DNS_T_AAAA) {
+			if (memcmp(addr_map->ipv6_addr, addr, addr_len) == 0) {
+				addr_map->hitnum++;
+				addr_map->recv_tick = get_tick_count();
+				pthread_mutex_unlock(&request->ip_map_lock);
+				return -1;
+			}
+		}
+	}
+	request->ip_map_num++;
+
+	addr_map = malloc(sizeof(*addr_map));
+	if (addr_map == NULL) {
+		pthread_mutex_unlock(&request->ip_map_lock);
+		tlog(TLOG_ERROR, "malloc failed");
+		return -1;
+	}
+	memset(addr_map, 0, sizeof(*addr_map));
+
+	addr_map->addr_type = addr_type;
+	addr_map->hitnum = 1;
+	addr_map->recv_tick = get_tick_count();
+	addr_map->resp_packet = resp_packet;
+	if (resp_packet) {
+		_dns_response_packet_get(resp_packet);
+	}
+	memcpy(addr_map->addr, addr, addr_len);
+	hash_add(request->ip_map, &addr_map->node, key);
+	pthread_mutex_unlock(&request->ip_map_lock);
+
+	return 0;
+}
+
+static int _dns_server_request_fastip_complete_A(struct dns_request *request)
+{
+	struct dns_cache_data *cache_data = NULL;
 	char *cname = NULL;
 	int cname_ttl = dns_conf_rr_ttl;
-	struct dns_cache_data *cache_data = NULL;
 
 	if (request->has_cname) {
 		cname = request->cname;
@@ -858,13 +954,6 @@ static int _dns_server_request_complete_A(struct dns_request *request)
 	}
 
 	if (request->has_ipv4 != 0) {
-		tlog(TLOG_INFO, "result: %s, rcode: %d,  %d.%d.%d.%d\n", request->domain, request->rcode, request->ipv4_addr[0],
-			 request->ipv4_addr[1], request->ipv4_addr[2], request->ipv4_addr[3]);
-
-		request->has_soa = 0;
-		if (request->has_ping_result == 0 && request->ttl_v4 > DNS_SERVER_TMOUT_TTL) {
-			request->ttl_v4 = DNS_SERVER_TMOUT_TTL;
-		}
 		dns_cache_set_data_addr(cache_data, request->server_flags, cname, cname_ttl, request->ipv4_addr, DNS_RR_A_LEN);
 	} else if (request->has_soa) {
 		dns_cache_set_data_soa(cache_data, request->server_flags, cname, cname_ttl);
@@ -890,17 +979,165 @@ errout:
 	return -1;
 }
 
-static int _dns_server_request_complete_AAAA(struct dns_request *request)
+static int _dns_server_update_whole_packet_cache(struct dns_request *request, dns_type_t qtype, struct dns_response_packet *resp_packet) {
+
+	if (_dns_server_has_bind_flag(request, BIND_FLAG_NO_CACHE) == 0) {
+		return 0;
+	}
+
+	struct dns_cache_data *cache_packet = dns_cache_new_data_packet(request->server_flags, resp_packet->inpacket, resp_packet->inpacket_len);
+	if (cache_packet == NULL) {
+		return 0;
+	}
+
+	if (_dns_server_request_update_cache(request, qtype, cache_packet) != 0) {
+		tlog(TLOG_WARN, "update packet cache failed.");
+	}
+
+	return 0;
+}
+
+static int _dns_server_request_wholeresponse_complete_A(struct dns_request *request) 
 {
-	int ret = -1;
+	// response whole package
+	struct dns_ip_address *addr_map = NULL;
+
+	addr_map = _dns_ip_address_get(request, request->ipv4_addr, DNS_T_A);
+	if (addr_map == NULL || addr_map->resp_packet == NULL) {
+		tlog(TLOG_WARN, "Not found ip address packet");
+		return -1;
+	}
+
+	return _dns_server_update_whole_packet_cache(request, DNS_T_A, addr_map->resp_packet);
+}
+
+static int _dns_server_request_complete_A(struct dns_request *request)
+{
+	if (request->has_ipv4 == 0) {
+		return 0;
+	}
+
+	tlog(TLOG_INFO, "result: %s, rcode: %d,  %d.%d.%d.%d\n", request->domain, request->rcode, request->ipv4_addr[0],
+		request->ipv4_addr[1], request->ipv4_addr[2], request->ipv4_addr[3]);
+
+	request->has_soa = 0;
+	if (request->has_ping_result == 0 && request->ttl_v4 > DNS_SERVER_TMOUT_TTL) {
+		request->ttl_v4 = DNS_SERVER_TMOUT_TTL;
+	}
+
+	if (request->resp_mode == RESPONSE_MODE_FASTEST_IP) {
+		return _dns_server_request_fastip_complete_A(request);
+	} else if (request->resp_mode == RESPONSE_MODE_WHOLE_RESPONSE) {
+		return _dns_server_request_wholeresponse_complete_A(request);
+	}
+
+	tlog(TLOG_ERROR, "response mode is invalid. %d", request->resp_mode);
+	
+	return -1;
+}
+
+static int _dns_server_request_set_soa_cache(struct dns_request *request)
+{
 	char *cname = NULL;
 	int cname_ttl = dns_conf_rr_ttl;
 	struct dns_cache_data *cache_data = NULL;
+
+	if (_dns_server_has_bind_flag(request, BIND_FLAG_NO_CACHE) == 0) {
+		return 0;
+	}
 
 	if (request->has_cname) {
 		cname = request->cname;
 		cname_ttl = request->ttl_cname;
 	}
+
+	cache_data = dns_cache_new_data();
+	if (cache_data == NULL) {
+		goto errout;
+	}
+
+	dns_cache_set_data_soa(cache_data, request->server_flags, cname, cname_ttl);
+
+	if (_dns_server_request_update_cache(request, DNS_T_AAAA, cache_data) != 0) {
+		goto errout;
+	}
+
+	return 0;
+errout:
+	if (cache_data) {
+		dns_cache_data_free(cache_data);
+	}
+
+	return -1;
+}
+
+static int _dns_server_request_wholeresponse_complete_AAAA(struct dns_request *request)
+{
+	int ret = -1;
+	struct dns_ip_address *addr_ipv6_map = NULL;
+	struct dns_ip_address *addr_ipv4_map = NULL;
+
+	if (request->has_ipv6) {
+		tlog(TLOG_INFO,
+			 "result: %s, rcode: %d,  %.2x%.2x:%.2x%.2x:%.2x%.2x:%.2x%.2x:%.2x%.2x:%.2x%.2x:%.2x%.2x:%.2x%.2x",
+			 request->domain, request->rcode, request->ipv6_addr[0], request->ipv6_addr[1], request->ipv6_addr[2],
+			 request->ipv6_addr[3], request->ipv6_addr[4], request->ipv6_addr[5], request->ipv6_addr[6],
+			 request->ipv6_addr[7], request->ipv6_addr[8], request->ipv6_addr[9], request->ipv6_addr[10],
+			 request->ipv6_addr[11], request->ipv6_addr[12], request->ipv6_addr[13], request->ipv6_addr[14],
+			 request->ipv6_addr[15]);
+
+		if (request->has_ping_result == 0 && request->ttl_v6 > DNS_SERVER_TMOUT_TTL) {
+			request->ttl_v6 = DNS_SERVER_TMOUT_TTL;
+		}
+
+		addr_ipv6_map = _dns_ip_address_get(request, request->ipv4_addr, DNS_T_AAAA);
+		if (addr_ipv6_map && addr_ipv6_map->resp_packet) {
+			_dns_server_update_whole_packet_cache(request, DNS_T_AAAA, addr_ipv6_map->resp_packet);
+		}
+
+		request->has_soa = 0;
+	} else if (request->has_soa) {
+		_dns_server_request_set_soa_cache(request);
+	}
+
+	if (request->has_ipv4 && (request->ping_ttl_v4 > 0)) {
+		tlog(TLOG_INFO, "result: %s, rcode: %d,  %d.%d.%d.%d\n", request->domain, request->rcode, request->ipv4_addr[0],
+			 request->ipv4_addr[1], request->ipv4_addr[2], request->ipv4_addr[3]);
+
+		/* if ipv4 is fasting than ipv6, add ipv4 to cache, and return SOA for AAAA request */
+		if ((request->ping_ttl_v4 + (dns_conf_dualstack_ip_selection_threshold * 10)) < request->ping_ttl_v6 ||
+			request->ping_ttl_v6 < 0) {
+			tlog(TLOG_DEBUG, "Force IPV4 perfered.");
+			addr_ipv4_map = _dns_ip_address_get(request, request->ipv4_addr, DNS_T_A);
+			if (addr_ipv4_map && addr_ipv4_map->resp_packet) {
+				_dns_server_update_whole_packet_cache(request, DNS_T_A, addr_ipv4_map->resp_packet);
+			}
+
+			if (request->dualstack_selection) {
+				if (_dns_server_reply_SOA(DNS_RC_NOERROR, request) != 0) {
+					ret = -1;
+					goto errout;
+				}
+
+				ret = 1;
+				goto errout;
+			}
+		}
+	}
+
+	request->has_ipv4 = 0;
+
+	return 0;
+errout:
+	return ret;
+}
+
+static int _dns_server_request_fastip_complete_AAAA(struct dns_request *request) 
+{
+	int ret = -1;
+	char *cname = NULL;
+	int cname_ttl = dns_conf_rr_ttl;
+	struct dns_cache_data *cache_data = NULL;
 
 	cache_data = dns_cache_new_data();
 	if (cache_data == NULL) {
@@ -985,6 +1222,21 @@ errout:
 	return ret;
 }
 
+static int _dns_server_request_complete_AAAA(struct dns_request *request)
+{
+	int ret = 0;
+
+	if (request->resp_mode == RESPONSE_MODE_FASTEST_IP) {
+		ret = _dns_server_request_fastip_complete_AAAA(request);
+	} else if (request->resp_mode == RESPONSE_MODE_WHOLE_RESPONSE) {
+		ret = _dns_server_request_wholeresponse_complete_AAAA(request);
+	}
+
+	request->has_ipv4 = 0;
+
+	return ret;
+}
+
 static int dns_server_update_reply_packet_id(struct dns_request *request, unsigned char *inpacket, int inpacket_len)
 {
 	struct dns_head *dns_head = (struct dns_head *)inpacket;
@@ -1002,43 +1254,43 @@ static int dns_server_update_reply_packet_id(struct dns_request *request, unsign
 static int _dns_server_reply_whole_packet(struct dns_request *request)
 {
 	int ret = 0;
+	struct dns_ip_address *addr_map = NULL;
+	struct dns_update_param param;
+	unsigned char *inpacket;
+	int inpacket_len;
 
-	if (request->resp_mode != RESPONSE_MODE_WHOLE_RESPONSE || request->resp_packet == NULL) {
+	if (request->resp_mode != RESPONSE_MODE_WHOLE_RESPONSE) {
 		return -1;
 	}
 
-	unsigned char *inpacket = request->resp_packet->inpacket;
-	int inpacket_len = request->resp_packet->inpacket_len;
-
-	if (request->result_callback) {
-		_dns_result_callback(request);
+	if (request->conn == NULL) {
+		return 0;
 	}
 
-	_dns_server_audit_log(request);
-
-	if (request->conn) {
-		/* When passthrough, modify the id to be the id of the client request. */
-		struct dns_update_param param;
-		param.id = request->id;
-		param.cname_ttl = request->ttl_cname;
+	if (request->has_ipv4 && request->qtype == DNS_T_A) {
+		addr_map = _dns_ip_address_get(request, request->ipv4_addr, DNS_T_A);
 		param.ip_ttl = request->ttl_v4;
-		dns_packet_update(inpacket, inpacket_len, &param);
-		ret = _dns_reply_inpacket(request, inpacket, inpacket_len);
 	}
 
-	if (_dns_server_has_bind_flag(request, BIND_FLAG_NO_CACHE) != 0 &&
-		(request->qtype == DNS_T_AAAA || request->qtype == DNS_T_A)) {
-		struct dns_cache_data *cache_packet = dns_cache_new_data_packet(request->server_flags, inpacket, inpacket_len);
-		if (cache_packet == NULL) {
-			return ret;
-		}
-
-		if (_dns_server_request_update_cache(request, request->qtype, cache_packet) != 0) {
-			tlog(TLOG_WARN, "update packet cache failed.");
-		}
+	if (request->has_ipv6 && request->qtype == DNS_T_AAAA) {
+		addr_map = _dns_ip_address_get(request, request->ipv6_addr, DNS_T_AAAA);
+		param.ip_ttl = request->ttl_v6;
 	}
 
-	return 0;	
+	if (request->has_soa || addr_map == NULL || addr_map->resp_packet == NULL) {
+		_dns_server_reply_SOA(DNS_RC_NOERROR, request);
+		return 0;
+	}
+
+	inpacket = addr_map->resp_packet->inpacket;
+	inpacket_len = addr_map->resp_packet->inpacket_len;
+
+	param.id = request->id;
+	param.cname_ttl = request->ttl_cname;
+	dns_packet_update(inpacket, inpacket_len, &param);
+	ret = _dns_reply_inpacket(request, inpacket, inpacket_len);
+
+	return ret;
 }
 
 static int _dns_server_request_complete(struct dns_request *request)
@@ -1049,10 +1301,6 @@ static int _dns_server_request_complete(struct dns_request *request)
 		return 0;
 	}
 
-	if (request->resp_mode == RESPONSE_MODE_WHOLE_RESPONSE && request->resp_packet) {
-		return _dns_server_reply_whole_packet(request);
-	}
-
 	if (request->qtype == DNS_T_A) {
 		if (_dns_server_request_complete_A(request) != 0) {
 			tlog(TLOG_ERROR, "complete DNS A failed.");
@@ -1060,10 +1308,7 @@ static int _dns_server_request_complete(struct dns_request *request)
 		}
 	} else if (request->qtype == DNS_T_AAAA) {
 		ret = _dns_server_request_complete_AAAA(request);
-		if (ret != 0) {
-			if (ret == 1) {
-				return 0;
-			}
+		if (ret != 0 && ret != 1) {
 			tlog(TLOG_ERROR, "complete DNS A failed.");
 			return -1;
 		}
@@ -1076,14 +1321,21 @@ static int _dns_server_request_complete(struct dns_request *request)
 	/* update ipset */
 	_dns_setup_ipset(request);
 
+	if (ret == 1) {
+		return 0;
+	}
+
 	_dns_result_callback(request);
 
 	if (request->prefetch) {
 		return 0;
 	}
 
-	/* return result to client */
-	_dns_reply(request);
+	if (request->resp_mode == RESPONSE_MODE_FASTEST_IP) {
+		_dns_reply(request);
+	} else if (request->resp_mode == RESPONSE_MODE_WHOLE_RESPONSE) {
+		_dns_server_reply_whole_packet(request);
+	}
 
 	return 0;
 }
@@ -1272,103 +1524,6 @@ errout:
 	return NULL;
 }
 
-struct dns_ip_address *_dns_ip_address_get(struct dns_request *request, unsigned char *addr, dns_type_t addr_type)
-{
-	uint32_t key = 0;
-	struct dns_ip_address *addr_map = NULL;
-	struct dns_ip_address *addr_tmp = NULL;
-	int addr_len = 0;
-
-	if (addr_type == DNS_T_A) {
-		addr_len = DNS_RR_A_LEN;
-	} else if (addr_type == DNS_T_AAAA) {
-		addr_len = DNS_RR_AAAA_LEN;
-	} else {
-		return NULL;
-	}
-
-	/* store the ip address and the number of hits */
-	key = jhash(addr, addr_len, 0);
-	pthread_mutex_lock(&request->ip_map_lock);
-	hash_for_each_possible(request->ip_map, addr_tmp, node, key)
-	{
-		if (addr_type == DNS_T_A) {
-			if (memcmp(addr_tmp->ipv4_addr, addr, addr_len) == 0) {
-				addr_map = addr_tmp;
-				break;
-			}
-		} else if (addr_type == DNS_T_AAAA) {
-			if (memcmp(addr_tmp->ipv6_addr, addr, addr_len) == 0) {
-				addr_map = addr_tmp;
-				break;
-			}
-		}
-	}
-	pthread_mutex_unlock(&request->ip_map_lock);
-
-	return addr_map;
-}
-
-static int _dns_ip_address_check_add(struct dns_request *request, unsigned char *addr, dns_type_t addr_type,
-									 struct dns_response_packet *resp_packet)
-{
-	uint32_t key = 0;
-	struct dns_ip_address *addr_map = NULL;
-	int addr_len = 0;
-
-	if (addr_type == DNS_T_A) {
-		addr_len = DNS_RR_A_LEN;
-	} else if (addr_type == DNS_T_AAAA) {
-		addr_len = DNS_RR_AAAA_LEN;
-	} else {
-		return -1;
-	}
-
-	/* store the ip address and the number of hits */
-	key = jhash(addr, addr_len, 0);
-	pthread_mutex_lock(&request->ip_map_lock);
-	hash_for_each_possible(request->ip_map, addr_map, node, key)
-	{
-		if (addr_type == DNS_T_A) {
-			if (memcmp(addr_map->ipv4_addr, addr, addr_len) == 0) {
-				addr_map->hitnum++;
-				addr_map->recv_tick = get_tick_count();
-				pthread_mutex_unlock(&request->ip_map_lock);
-				return -1;
-			}
-		} else if (addr_type == DNS_T_AAAA) {
-			if (memcmp(addr_map->ipv6_addr, addr, addr_len) == 0) {
-				addr_map->hitnum++;
-				addr_map->recv_tick = get_tick_count();
-				pthread_mutex_unlock(&request->ip_map_lock);
-				return -1;
-			}
-		}
-	}
-	request->ip_map_num++;
-
-	addr_map = malloc(sizeof(*addr_map));
-	if (addr_map == NULL) {
-		pthread_mutex_unlock(&request->ip_map_lock);
-		tlog(TLOG_ERROR, "malloc failed");
-		return -1;
-	}
-	memset(addr_map, 0, sizeof(*addr_map));
-
-	addr_map->addr_type = addr_type;
-	addr_map->hitnum = 1;
-	addr_map->recv_tick = get_tick_count();
-	addr_map->resp_packet = resp_packet;
-	if (resp_packet) {
-		_dns_response_packet_get(resp_packet);
-	}
-	memcpy(addr_map->addr, addr, addr_len);
-	hash_add(request->ip_map, &addr_map->node, key);
-	pthread_mutex_unlock(&request->ip_map_lock);
-
-	return 0;
-}
-
 static void _dns_server_ping_result(struct ping_host_struct *ping_host, const char *host, FAST_PING_RESULT result,
 									struct sockaddr *addr, socklen_t addr_len, int seqno, int ttl, struct timeval *tv,
 									void *userptr)
@@ -1391,7 +1546,6 @@ static void _dns_server_ping_result(struct ping_host_struct *ping_host, const ch
 
 	unsigned int rtt = tv->tv_sec * 10000 + tv->tv_usec / 100;
 
-	struct dns_ip_address *addr_map = NULL;
 	switch (addr->sa_family) {
 	case AF_INET: {
 		struct sockaddr_in *addr_in;
@@ -1400,10 +1554,6 @@ static void _dns_server_ping_result(struct ping_host_struct *ping_host, const ch
 			request->ping_ttl_v4 = rtt;
 			request->has_ipv4 = 1;
 			memcpy(request->ipv4_addr, &addr_in->sin_addr.s_addr, 4);
-			addr_map = _dns_ip_address_get(request, request->ipv4_addr, DNS_T_A);
-			if (addr_map && addr_map->resp_packet) {
-				request->resp_packet = addr_map->resp_packet;
-			}
 		}
 
 		if (request->qtype == DNS_T_AAAA && request->dualstack_selection) {
@@ -1420,20 +1570,12 @@ static void _dns_server_ping_result(struct ping_host_struct *ping_host, const ch
 				request->ping_ttl_v4 = rtt;
 				request->has_ipv4 = 1;
 				memcpy(request->ipv4_addr, addr_in6->sin6_addr.s6_addr + 12, 4);
-				addr_map = _dns_ip_address_get(request, request->ipv4_addr, DNS_T_A);
-				if (addr_map && addr_map->resp_packet) {
-					request->resp_packet = addr_map->resp_packet;
-				}
 			}
 		} else {
 			if (request->ping_ttl_v6 > rtt) {
 				request->ping_ttl_v6 = rtt;
 				request->has_ipv6 = 1;
 				memcpy(request->ipv6_addr, addr_in6->sin6_addr.s6_addr, 16);
-				addr_map = _dns_ip_address_get(request, request->ipv6_addr, DNS_T_AAAA);
-				if (addr_map && addr_map->resp_packet) {
-					request->resp_packet = addr_map->resp_packet;
-				}
 			}
 		}
 	} break;
@@ -1667,10 +1809,6 @@ static int _dns_server_process_answer_A(struct dns_rrs *rrs, struct dns_result_c
 		return -1;
 	}
 
-	if (request->resp_packet == NULL) {
-		request->resp_packet = resp_packet;
-	}
-
 	sprintf(ip, "%d.%d.%d.%d", addr[0], addr[1], addr[2], addr[3]);
 
 	/* start ping */
@@ -1746,10 +1884,6 @@ static int _dns_server_process_answer_AAAA(struct dns_rrs *rrs, struct dns_resul
 	if (_dns_ip_address_check_add(request, addr, DNS_T_AAAA, resp_packet) != 0) {
 		_dns_server_request_release(request);
 		return -1;
-	}
-
-	if (request->resp_packet == NULL) {
-		request->resp_packet = resp_packet;
 	}
 
 	sprintf(ip, "[%.2x%.2x:%.2x%.2x:%.2x%.2x:%.2x%.2x:%.2x%.2x:%.2x%.2x:%.2x%.2x:%.2x%.2x]", addr[0], addr[1], addr[2],
@@ -1855,7 +1989,7 @@ static int _dns_server_passthrough_rule_check(struct dns_result_context *context
 	int j = 0;
 	struct dns_rrs *rrs = NULL;
 	int ip_check_result = 0;
-	int is_result_strict = 0;
+	int is_result_discard = 0;
 
 	struct dns_request *request = context->request;
 	struct dns_packet *packet = context->packet;
@@ -1874,8 +2008,9 @@ static int _dns_server_passthrough_rule_check(struct dns_result_context *context
 	for (j = 1; j < DNS_RRS_END; j++) {
 		rrs = dns_get_rrs_start(packet, j, &rr_count);
 		for (i = 0; i < rr_count && rrs; i++, rrs = dns_get_rrs_next(packet, rrs)) {
-			if (rrs->type == request->qtype || rrs->type == DNS_T_SOA) {
-				is_result_strict = 1;
+			if ((rrs->type == DNS_T_A || rrs->type == DNS_T_AAAA) &&
+				(request->qtype != DNS_T_A && request->qtype != DNS_T_AAAA)) {
+				is_result_discard = 1;
 			}
 
 			switch (rrs->type) {
@@ -1938,7 +2073,7 @@ static int _dns_server_passthrough_rule_check(struct dns_result_context *context
 		}
 	}
 
-	if (is_result_strict == 0) {
+	if (is_result_discard == 1) {
 		return 0;
 	}
 
